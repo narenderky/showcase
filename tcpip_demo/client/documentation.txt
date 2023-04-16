@@ -1,0 +1,199 @@
+Flow of the client program:
+1. 
+"273 int main(int argc, char *argv[])
+This is the "main" function. This is the first thing that is called in our program when the executable file is run from the command line. It takes two arguments. First is argc which is the number of command line parameters including the program name. Second argument argv contains the actual values of the command line parameters. For our program the required arguments are the IP address of the server and the port number to which to connect to. If we don't specify one or both of them then number of command line arguments will be less than 3 and our program will return with failure from the following location:
+
+282         if (argc < 3) {
+283                 fprintf(stderr, "Usage: ./client <server_ip> <port_no>\n");
+284                 exit(-1);
+285         }
+
+
+
+2.
+"12 void connect_server(int *sockfd, struct sockaddr_in *server_addr, char *server, int port)"
+connect_server function is used to connect to the server. This function uses the "socket" system call to create a socket file descriptor which is then used to connect to the server using the "connect" system call. The connect system call requires the server IP address and the port number to be sent using sockaddr_in structure. If connect fails for some reason (e.g if the port number is not correct or the IP address is not correct) then we return with an error. At the end of the function we send buffer queue and the receive buffer queue using TAILQ_INIT.
+
+
+
+3.
+Next we reset the file descriptors that we use in our program. We are going to use 2 file descriptors in our program. First one is the file descriptor for standard input using which we will get the inputs from the server. The second one the socket file descriptor which we used to connect to the server and from which we recieve messages from the server. We will monitor these 2 file descriptors using the "select" system call.
+
+
+
+4.
+"304                 sel_ret = select(max_sd+1, &read_sd, NULL, NULL, &tv);"
+The select system call sets a bit for each file descriptor in the read_sd variable if there is some data available on that file descriptor. The select system call will keep blocking unless there is some data available on one of the file descriptor or the timeout value specified using the tv variable has elapsed. We are using 100 milliseconds for timeout so that we can periodically check our send buffer queue to send out any retransmissions if required.
+
+
+
+5.
+"
+317                 for (count = 0; count <= max_sd; count++ ) {
+318                         //Process only if something happened on this descriptor. read_sd was set by select system call.
+319                         if(FD_ISSET(count, &read_sd)) {
+320                                 chat(count, sd, user_name);
+321                         }
+322                 }
+"
+Using the above code we check if the file descriptor is set. If the file descriptor is set it means that it has received some data. Call the chat function if some data is available on the file descriptor.
+
+
+
+6.
+"236 void chat(int count, int sockfd,char *user_name)"
+The chat fucntion does 2 things. Firstly, if there is some data received on the standard input file descriptor then it processes any message that the user has typed on the command line. Secondly, it processes any message that it has received from the server.
+
+
+
+7. 
+"248                 fgets(buffer, MAXBUFFER, stdin);"
+The above code gets the users message from standard input (stdin) and stores the message in "buffer" variable. If the user types quit then the client will exit.
+
+
+
+8.
+" 62 struct sq_entry *add_to_send_queue(int sockfd, char *payload, int pl_size)"
+The above code will prepend the header in fornt of the message typed by the user and then add the message to the send queue. The header is of the format "SEQ_NUM:ACK_NUM:PURE_ACK". For user originated messages PURE_ACK is set to 0. The send queue entry is allocated using the following line of code.
+ 69         entry = malloc(sizeof(struct sq_entry));
+
+The header is set using the following code. The sequence number is set using the variable "next_seq_num" while the ack_num is set using the "expected_seq_num" variable.
+ 76         num_char = sprintf(entry->rp, "%lu,%lu,%d:", next_seq_num, expected_seq_num, 0);
+
+We record some information like the time at which the packet was sent so that we can use this information when we want to retrasmit the packet. This is done using the following line of code.
+ 79         entry->tsec = time(NULL);
+
+Then we add the packet to our send buffer queue using the following line of code:
+ 82         TAILQ_INSERT_TAIL(&shead, entry, entries);
+
+In the end we increase the "next_sequence_num" variable so that we can use a higher sequence number for the next packet.
+
+
+
+9.
+"261                 send(sockfd, (char *)(&(sentry->rp)), strlen(sentry->rp), MSG_DONTWAIT);"
+The above line of code is used to send the message to the server using the socket file descriptor.
+
+
+
+10.
+"265                 num_byte_recvd = recv(sockfd, recv_buf, MAXBUFFER, 0);"
+The above line of code is used to receive a message from the server. If a message is received then num_byte_recvd will be set to a number > 0. The received data is present in recv_buf. 
+
+
+
+11.
+" 90 int process_recv_packet(int sockfd, char *packet, int pkt_size)"
+This function is used to process the packets received from the server.
+First we identify the fields in the header. The fields in the header are separated by ":". A packet is of the format "SEQ_NUM:ACK_NUM:PURE_ACK:PAYLOAD". We use the strtok API to get the SEQ_NUM first. If the sequnce number is not valid then maybe the header has been corrupted by the server. So, we can just drop this packet. Simiarly we need to extract the ACK_NUM and PURE_ACK fields. If they are not valid then the packet can be dropped.
+
+
+
+12.
+"129         if (atoi(seq_num) > expected_seq_num) {"
+The above line of code checks if the sequence number in the incoming packet is greater than the expected sequence number. If it is greater then that means we received the packet out of order, so we need to add this packet to our receive buffer queue.
+
+
+
+13.
+"
+140                 rn2 = TAILQ_LAST(&rhead, rq_head);
+141                 if (rn2 && atoi(seq_num) > rn2->seq_num) {
+"
+Here rn2 is the last element in the receive buffer queue. If the sequence number of the current packet is greater than the sequence number of the last packet then insert this packet after the last element.
+
+
+
+14.
+"146                 } else if (rn1) {"
+...
+...
+ 154                                 } else if (rn1->seq_num > atoi(seq_num)) {
+"
+The above code checks if the sequence number of the current packet is less than packet in the receiver buffer queue. We will go through each packet in the list and compare the sequence number of the current packet with the sequence number of the packets in the list. and add the current packet when we find a sequence number that is greater than us. This will keep the receiver buffer queue sorted at all times and help us in removing the packets from the queue when a packet with larger ack number is received. 
+
+
+
+15.
+"174                 if (atoi(pure_ack) == 0) {"
+If we reached the above code then that means that we have received the packet in correct order and this packet is not a pure ack packet. Since this is not a pure ack packet is carries some data with it.
+
+
+
+16.
+"
+175                         if (atoi(seq_num) == expected_seq_num) {
+176                                 printf("%s" , data);
+177                                 fflush(stdout);
+178                                 //Increase the next expected sequence number.
+179                                 expected_seq_num++;
+180                         }
+"
+The above code is executed when the sequence number on the current packet is equal to the expected sequence number. In such as case we printf the payload data on the stdout and increase the expected_seq_num.
+
+
+
+17.
+"
+188                         //Send a pure ack for this packet 
+189                         send(sockfd, rp, strlen(rp), MSG_DONTWAIT);
+"
+This above code sends a pure ack to for the packet received in step 16 above. This is required in order to tell the other client that we have received its packet correctly and it can now remove the packet from its send buffer queue.
+
+
+
+18.
+"
+191                         rn1 = TAILQ_FIRST(&rhead);
+192                         // Check if we need to process any packets that are already present in the receiver buffer queue.
+193                         while (rn1 != NULL) {
+"
+The above code checks the receiver buffer queue and sees if we need to free any more packets from the receive buffer queue. This might happen if we received some packet out of order in the past. We need to free those packets if they are now eligible to be free i.e their sequence number is same as the expected_seq_num. Addtionally, we need to send pure acks for these packets.
+
+
+
+19. 
+"
+213                 } else {
+214                         fprintf(stderr, "Pure ack is received: %d\n", atoi(pure_ack));
+215                         //Remove this packet from the send queue since ack have been received.
+216                         fprintf(stderr, "data %s\n", data);
+217 
+218                         sn1 = TAILQ_FIRST(&shead);
+219                         //Remove all the packets which have sequence number lower than the ack.
+220                         while (sn1 != NULL) {
+221                                 sn2 = TAILQ_NEXT(sn1, entries);
+222                                 //if (sn1->seq_num <= atoi(ack_num)) {
+223                                 if (sn1->seq_num < atoi(ack_num)) {
+"
+If a pure ack is received then we need to remove all the packets in the receive queue whose sequence number is less then the ack number received.
+
+
+
+20.
+" 36 void check_retrans_timeout()"
+The above function checks if there are packets in send buffer queue that are eligible for retransmission. We go through each packet in the send buffer queue and check when was it retransmitted the first time. A packet is eligible for retransmission if it has been in send queue for more than 5 seconds. The following code does this check.
+"
+ 42         while (sn1 != NULL) {
+ 43                 sn2 = TAILQ_NEXT(sn1, entries);
+ 44                 if (time(NULL) > (sn1->tsec + 5)) {
+"
+
+Additionally, if a packet has been retrasmitted 25 times then we can assume that the link is dead and we can close the connection. The following code does this:
+"
+ 45                         if (sn1->num_retrans >= 25) {
+ 46                                 //Connection timed out. Close the connection
+ 47                                 fprintf(stderr, "Closing connection due to too many timeouts.\n");
+ 48                                 close(sn1->sockfd);
+"
+
+The below code does the actual retransmission:
+"
+ 50                                 //send_retransmission
+ 51                                 fprintf(stderr, "Sending retransmission for seq_num. %d\n", sn1->seq_num);
+ 52                                 send(sn1->sockfd, sn1->rp, strlen(sn1->rp), MSG_DONTWAIT);
+ 53                                 sn1->num_retrans++;
+ 54                                 sn1->tsec = time(NULL);
+ 55                                 usleep(100 * 1000);
+"
+
